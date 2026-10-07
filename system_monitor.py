@@ -1,798 +1,930 @@
-#!/usr/bin/env python3
-
 import sys
-import time
+import os
+import re
 import platform
+import subprocess
+import time
+
 import psutil
 
-from PySide6.QtCore import Qt, QTimer, QRectF
-from PySide6.QtGui import QPainter, QPen, QColor, QFont
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication,
+    QMainWindow,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QGridLayout,
     QLabel,
     QProgressBar,
+    QScrollArea,
     QFrame,
-    QSizePolicy,
 )
 
 
-class CircularGauge(QWidget):
-    def __init__(self, title, color):
-        super().__init__()
+def fmt_bytes(value):
+    value = float(value or 0)
 
-        self.title = title
-        self.color = QColor(color)
-        self.value = 0
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
 
-        self.setMinimumSize(230, 230)
+    return f"{value:.1f} PB"
 
-    def setValue(self, value):
-        self.value = max(0, min(100, float(value)))
-        self.update()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+def fmt_speed(value):
+    return f"{fmt_bytes(value)}/s"
 
-        size = min(self.width(), self.height())
-        margin = 25
 
-        rect = QRectF(
-            (self.width() - size) / 2 + margin,
-            (self.height() - size) / 2 + margin,
-            size - margin * 2,
-            size - margin * 2,
+def fmt_temp(value):
+    return "N/A" if value is None else f"{value:.1f} °C"
+
+
+def uptime():
+    seconds = int(time.time() - psutil.boot_time())
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def get_cpu_model():
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+
+    return platform.processor() or "Unbekannt"
+
+
+def get_os():
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            text = f.read()
+
+        match = re.search(
+            r'^PRETTY_NAME="?(.+?)"?$',
+            text,
+            re.MULTILINE,
         )
 
-        # Hintergrund
-        background_pen = QPen(QColor("#303640"))
-        background_pen.setWidth(18)
-        background_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        if match:
+            return match.group(1)
 
-        painter.setPen(background_pen)
-        painter.drawArc(rect, 0, 360 * 16)
+    except Exception:
+        pass
 
-        # Fortschritt
-        progress_pen = QPen(self.color)
-        progress_pen.setWidth(18)
-        progress_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    return platform.system()
 
-        painter.setPen(progress_pen)
 
-        angle = int(-self.value * 360 / 100 * 16)
-
-        painter.drawArc(
-            rect,
-            90 * 16,
-            angle
+def get_gpu():
+    try:
+        result = subprocess.run(
+            ["sh", "-c", "lspci | grep -Ei 'VGA|3D|Display'"],
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
 
-        # Prozent
-        painter.setPen(QColor("#ffffff"))
+        lines = result.stdout.strip().splitlines()
 
-        value_font = QFont("Noto Sans")
-        value_font.setPointSize(28)
-        value_font.setBold(True)
+        if lines:
+            return " | ".join(
+                line.split(":", 2)[-1].strip()
+                for line in lines
+            )
 
-        painter.setFont(value_font)
+    except Exception:
+        pass
 
-        painter.drawText(
-            self.rect(),
-            Qt.AlignmentFlag.AlignCenter,
-            f"{self.value:.0f}%"
+    return "Nicht erkannt"
+
+
+def read_sensors():
+    data = {
+        "cpu_temp": None,
+        "fan": None,
+        "pwm": None,
+        "wifi_temp": None,
+        "pch_temp": None,
+        "nvme_temp": None,
+    }
+
+    try:
+        result = subprocess.run(
+            ["sensors"],
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
 
-        # Titel
-        title_font = QFont("Noto Sans")
-        title_font.setPointSize(10)
-        title_font.setBold(True)
+        text = result.stdout
 
-        painter.setFont(title_font)
-
-        title_rect = QRectF(
-            0,
-            self.height() / 2 + 42,
-            self.width(),
-            30
+        match = re.search(
+            r"thinkpad-isa-0000.*?"
+            r"fan1:\s+(\d+)\s+RPM.*?"
+            r"CPU:\s+\+?([\d.]+)°C.*?"
+            r"pwm1:\s+([\d.]+)%",
+            text,
+            re.S,
         )
 
-        painter.drawText(
-            title_rect,
-            Qt.AlignmentFlag.AlignCenter,
-            self.title
+        if match:
+            data["fan"] = float(match.group(1))
+            data["cpu_temp"] = float(match.group(2))
+            data["pwm"] = float(match.group(3))
+
+        match = re.search(
+            r"iwlwifi_1-virtual-0.*?"
+            r"temp1:\s+\+?([\d.]+)°C",
+            text,
+            re.S,
         )
+
+        if match:
+            data["wifi_temp"] = float(match.group(1))
+
+        match = re.search(
+            r"pch_skylake-virtual-0.*?"
+            r"temp1:\s+\+?([\d.]+)°C",
+            text,
+            re.S,
+        )
+
+        if match:
+            data["pch_temp"] = float(match.group(1))
+
+        match = re.search(
+            r"nvme-pci-[^\n]+.*?"
+            r"Composite:\s+\+?([\d.]+)°C",
+            text,
+            re.S,
+        )
+
+        if match:
+            data["nvme_temp"] = float(match.group(1))
+
+    except Exception:
+        pass
+
+    return data
+
+
+def get_battery():
+    data = {
+        "percent": None,
+        "status": "N/A",
+        "voltage": None,
+        "power": None,
+    }
+
+    try:
+        battery = psutil.sensors_battery()
+
+        if battery:
+            data["percent"] = battery.percent
+            data["status"] = (
+                "Netzbetrieb"
+                if battery.power_plugged
+                else "Akku"
+            )
+
+    except Exception:
+        pass
+
+    base = "/sys/class/power_supply/BAT0"
+
+    try:
+        with open(f"{base}/capacity") as f:
+            data["percent"] = float(f.read().strip())
+    except Exception:
+        pass
+
+    try:
+        with open(f"{base}/status") as f:
+            data["status"] = f.read().strip()
+    except Exception:
+        pass
+
+    try:
+        with open(f"{base}/voltage_now") as f:
+            data["voltage"] = float(f.read().strip()) / 1_000_000
+    except Exception:
+        pass
+
+    try:
+        with open(f"{base}/power_now") as f:
+            data["power"] = float(f.read().strip()) / 1_000_000
+    except Exception:
+        pass
+
+    return data
 
 
 class Card(QFrame):
-    def __init__(self):
+
+    def __init__(self, title):
         super().__init__()
+
         self.setObjectName("Card")
 
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(5)
 
-class CoreWidget(QFrame):
+        title_label = QLabel(title)
+        title_label.setObjectName("CardTitle")
+
+        layout.addWidget(title_label)
+
+        self.layout_box = layout
+
+
+class BarCard(Card):
+
+    def __init__(self, title):
+        super().__init__(title)
+
+        self.value = QLabel("--")
+        self.value.setObjectName("BigValue")
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(7)
+
+        self.layout_box.addWidget(self.value)
+        self.layout_box.addWidget(self.bar)
+
+    def set_value(self, value):
+        self.value.setText(f"{value:.1f} %")
+        self.bar.setValue(int(value))
+
+
+class CoreCard(QFrame):
+
     def __init__(self, number):
         super().__init__()
 
         self.setObjectName("Core")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(5)
+        layout.setContentsMargins(7, 5, 7, 5)
+        layout.setSpacing(2)
 
-        self.name = QLabel(f"CORE {number}")
+        self.name = QLabel(f"CPU {number}")
         self.name.setObjectName("CoreName")
 
-        self.usage = QLabel("0 %")
-        self.usage.setObjectName("CoreUsage")
+        self.value = QLabel("0 %")
+        self.value.setObjectName("CoreValue")
 
         self.bar = QProgressBar()
-        self.bar.setRange(0, 100)
-        self.bar.setValue(0)
         self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(8)
-
-        self.temperature = QLabel("Temperatur: -- °C")
-        self.temperature.setObjectName("CoreTemp")
+        self.bar.setFixedHeight(5)
 
         layout.addWidget(self.name)
-        layout.addWidget(self.usage)
+        layout.addWidget(self.value)
         layout.addWidget(self.bar)
-        layout.addWidget(self.temperature)
 
-    def update_core(self, usage, temperature=None):
-        self.usage.setText(f"{usage:.0f} %")
-        self.bar.setValue(int(usage))
-
-        if temperature is None:
-            self.temperature.setText("Temperatur: -- °C")
-        else:
-            self.temperature.setText(
-                f"Temperatur: {temperature:.1f} °C"
-            )
+    def update_value(self, value):
+        self.value.setText(f"{value:.0f} %")
+        self.bar.setValue(int(value))
 
 
-class SystemMonitor(QWidget):
+class SystemMonitor(QMainWindow):
 
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("System Monitor")
-        self.resize(1250, 900)
-        self.setMinimumSize(1000, 700)
+        self.resize(1200, 850)
 
-        self.previous_net = psutil.net_io_counters()
-        self.previous_net_time = time.monotonic()
-
-        self.core_widgets = []
+        self.last_net = psutil.net_io_counters()
+        self.last_time = time.time()
 
         self.build_ui()
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_system)
+        self.timer.timeout.connect(self.update_data)
         self.timer.start(1000)
 
-        self.update_system()
-
-    # =========================================================
-    # UI
-    # =========================================================
+        self.update_data()
 
     def build_ui(self):
 
-        main = QVBoxLayout(self)
-        main.setContentsMargins(20, 20, 20, 20)
-        main.setSpacing(14)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
 
-        # -----------------------------------------------------
-        # Header
-        # -----------------------------------------------------
+        container = QWidget()
 
-        title = QLabel("SYSTEM MONITOR")
+        main = QVBoxLayout(container)
+        main.setContentsMargins(12, 12, 12, 12)
+        main.setSpacing(8)
+
+        header = QHBoxLayout()
+
+        title_box = QVBoxLayout()
+
+        title = QLabel("System Monitor")
         title.setObjectName("Title")
 
-        subtitle = QLabel(
-            f"{platform.system()} {platform.release()}  •  "
-            f"{platform.machine()}"
-        )
+        subtitle = QLabel("Live-Systemübersicht")
         subtitle.setObjectName("Subtitle")
 
-        main.addWidget(title)
-        main.addWidget(subtitle)
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
 
-        # -----------------------------------------------------
-        # CPU / RAM
-        # -----------------------------------------------------
+        self.clock = QLabel("--:--:--")
+        self.clock.setObjectName("Clock")
 
-        gauges = QHBoxLayout()
-        gauges.setSpacing(15)
+        header.addLayout(title_box)
+        header.addStretch()
+        header.addWidget(self.clock)
 
-        # CPU
-        cpu_card = Card()
-        cpu_layout = QVBoxLayout(cpu_card)
+        main.addLayout(header)
 
-        self.cpu_gauge = CircularGauge(
-            "CPU AUSLASTUNG",
-            "#00d9ff"
-        )
+        top = QGridLayout()
+        top.setSpacing(7)
 
-        self.cpu_temp = QLabel("CPU Temperatur: -- °C")
-        self.cpu_temp.setObjectName("Temperature")
+        self.cpu_card = BarCard("CPU")
+        self.ram_card = BarCard("RAM")
+        self.swap_card = BarCard("SWAP")
+        self.temp_card = Card("CPU Temperatur")
 
-        self.cpu_clock = QLabel("CPU Takt: -- MHz")
-        self.cpu_clock.setObjectName("Info")
+        self.cpu_temp = QLabel("--")
+        self.cpu_temp.setObjectName("BigValue")
 
-        self.cpu_model = QLabel("CPU: --")
-        self.cpu_model.setObjectName("Info")
+        self.temp_card.layout_box.addWidget(self.cpu_temp)
 
-        cpu_layout.addWidget(self.cpu_gauge)
+        top.addWidget(self.cpu_card, 0, 0)
+        top.addWidget(self.ram_card, 0, 1)
+        top.addWidget(self.swap_card, 0, 2)
+        top.addWidget(self.temp_card, 0, 3)
 
-        cpu_layout.addWidget(
-            self.cpu_temp,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
+        main.addLayout(top)
 
-        cpu_layout.addWidget(
-            self.cpu_clock,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
+        info_row = QHBoxLayout()
+        info_row.setSpacing(7)
 
-        cpu_layout.addWidget(
+        cpu = Card("CPU")
+
+        self.cpu_model = QLabel("--")
+        self.cpu_model.setWordWrap(True)
+
+        self.cpu_info = QLabel("--")
+        self.load_info = QLabel("--")
+
+        for label in [
             self.cpu_model,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
+            self.cpu_info,
+            self.load_info,
+        ]:
+            label.setObjectName("Info")
+            cpu.layout_box.addWidget(label)
 
-        # RAM
-        ram_card = Card()
-        ram_layout = QVBoxLayout(ram_card)
+        temps = Card("Temperaturen")
 
-        self.ram_gauge = CircularGauge(
-            "RAM AUSLASTUNG",
-            "#55e67a"
-        )
+        self.temp_cpu = QLabel("--")
+        self.temp_wifi = QLabel("--")
+        self.temp_pch = QLabel("--")
+        self.temp_nvme = QLabel("--")
 
-        self.ram_info = QLabel("RAM: --")
-        self.ram_info.setObjectName("Info")
+        for label in [
+            self.temp_cpu,
+            self.temp_wifi,
+            self.temp_pch,
+            self.temp_nvme,
+        ]:
+            label.setObjectName("Info")
+            temps.layout_box.addWidget(label)
 
-        self.ram_free = QLabel("Frei: --")
-        self.ram_free.setObjectName("Info")
+        info_row.addWidget(cpu, 2)
+        info_row.addWidget(temps, 1)
 
-        ram_layout.addWidget(self.ram_gauge)
+        main.addLayout(info_row)
 
-        ram_layout.addWidget(
-            self.ram_info,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
-
-        ram_layout.addWidget(
-            self.ram_free,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
-
-        gauges.addWidget(cpu_card)
-        gauges.addWidget(ram_card)
-
-        main.addLayout(gauges)
-
-        # -----------------------------------------------------
-        # CPU Kerne
-        # -----------------------------------------------------
-
-        core_card = Card()
-        core_layout = QVBoxLayout(core_card)
-
-        core_title = QLabel("CPU-KERNE")
-        core_title.setObjectName("SectionTitle")
-
-        core_layout.addWidget(core_title)
+        cores = Card("Einzelne CPU-Kerne")
 
         self.core_grid = QGridLayout()
-        self.core_grid.setSpacing(8)
+        self.core_grid.setSpacing(5)
 
-        core_count = psutil.cpu_count(logical=True) or 1
+        self.core_widgets = []
 
-        for i in range(core_count):
+        count = psutil.cpu_count(logical=True) or 1
 
-            widget = CoreWidget(i)
+        for i in range(count):
 
-            row = i // 4
-            column = i % 4
-
-            self.core_grid.addWidget(
-                widget,
-                row,
-                column
-            )
+            widget = CoreCard(i)
 
             self.core_widgets.append(widget)
 
-        core_layout.addLayout(self.core_grid)
+            self.core_grid.addWidget(
+                widget,
+                i // 4,
+                i % 4,
+            )
 
-        main.addWidget(core_card)
+        cores.layout_box.addLayout(self.core_grid)
 
-        # -----------------------------------------------------
-        # Informationen
-        # -----------------------------------------------------
+        main.addWidget(cores)
 
-        info_card = Card()
-        info_layout = QGridLayout(info_card)
+        hardware_row = QHBoxLayout()
+        hardware_row.setSpacing(7)
 
-        info_title = QLabel("SYSTEM-INFORMATIONEN")
-        info_title.setObjectName("SectionTitle")
+        hardware = Card("Hardware")
 
-        info_layout.addWidget(
-            info_title,
-            0,
-            0,
-            1,
-            4
-        )
+        self.gpu = QLabel("--")
+        self.fan = QLabel("--")
+        self.pwm = QLabel("--")
 
-        self.uptime = QLabel("Uptime: --")
-        self.load = QLabel("Load: --")
-        self.swap = QLabel("Swap: --")
-        self.disk = QLabel("SSD: --")
+        for label in [
+            self.gpu,
+            self.fan,
+            self.pwm,
+        ]:
+            label.setObjectName("Info")
+            label.setWordWrap(True)
+            hardware.layout_box.addWidget(label)
 
-        self.network = QLabel("Netzwerk: --")
-        self.kernel = QLabel("Kernel: --")
-        self.memory = QLabel("RAM frei: --")
-        self.processes = QLabel("Prozesse: --")
+        system = Card("System")
 
-        info_labels = [
-            self.uptime,
-            self.load,
-            self.swap,
-            self.disk,
-            self.network,
+        self.os_label = QLabel("--")
+        self.kernel = QLabel("--")
+        self.desktop = QLabel("--")
+        self.hostname = QLabel("--")
+        self.python = QLabel("--")
+
+        for label in [
+            self.os_label,
             self.kernel,
-            self.memory,
-            self.processes,
-        ]
+            self.desktop,
+            self.hostname,
+            self.python,
+        ]:
+            label.setObjectName("Info")
+            label.setWordWrap(True)
+            system.layout_box.addWidget(label)
 
-        for label in info_labels:
-            label.setObjectName("InfoBox")
+        hardware_row.addWidget(hardware)
+        hardware_row.addWidget(system)
 
-        positions = [
-            (1, 0),
-            (1, 1),
-            (1, 2),
-            (1, 3),
-            (2, 0),
-            (2, 1),
-            (2, 2),
-            (2, 3),
-        ]
+        main.addLayout(hardware_row)
 
-        for label, position in zip(info_labels, positions):
-            info_layout.addWidget(label, *position)
+        lower = QHBoxLayout()
+        lower.setSpacing(7)
 
-        main.addWidget(info_card)
+        disk = Card("SSD")
 
-        # -----------------------------------------------------
-        # Status
-        # -----------------------------------------------------
+        self.disk_info = QLabel("--")
+        self.disk_info.setObjectName("Info")
 
-        self.status = QLabel(
-            "● Überwachung aktiv"
-        )
+        self.disk_bar = QProgressBar()
+        self.disk_bar.setTextVisible(False)
+        self.disk_bar.setFixedHeight(7)
 
-        self.status.setObjectName("Status")
+        disk.layout_box.addWidget(self.disk_info)
+        disk.layout_box.addWidget(self.disk_bar)
 
-        main.addWidget(
-            self.status,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
+        network = Card("Netzwerk")
 
-    # =========================================================
-    # Temperatur
-    # =========================================================
+        self.down = QLabel("--")
+        self.up = QLabel("--")
+        self.total_down = QLabel("--")
+        self.total_up = QLabel("--")
+        self.interfaces = QLabel("--")
 
-    def get_temperatures(self):
+        for label in [
+            self.down,
+            self.up,
+            self.total_down,
+            self.total_up,
+            self.interfaces,
+        ]:
+            label.setObjectName("Info")
+            label.setWordWrap(True)
+            network.layout_box.addWidget(label)
 
-        try:
-            sensors = psutil.sensors_temperatures()
+        battery = Card("Akku")
 
-            if not sensors:
-                return [], None
+        self.battery = QLabel("--")
+        self.battery_status = QLabel("--")
+        self.battery_voltage = QLabel("--")
+        self.battery_power = QLabel("--")
 
-            core_temps = []
+        for label in [
+            self.battery,
+            self.battery_status,
+            self.battery_voltage,
+            self.battery_power,
+        ]:
+            label.setObjectName("Info")
+            battery.layout_box.addWidget(label)
 
-            # Intel
-            if "coretemp" in sensors:
+        lower.addWidget(disk)
+        lower.addWidget(network)
+        lower.addWidget(battery)
 
-                for sensor in sensors["coretemp"]:
+        main.addLayout(lower)
 
-                    if sensor.current is not None:
+        processes = Card("Top-Prozesse")
 
-                        if sensor.label.lower().startswith("package"):
-                            continue
+        self.process_labels = []
 
-                        core_temps.append(sensor.current)
+        for _ in range(7):
 
-                package_temp = None
+            label = QLabel("--")
+            label.setObjectName("Process")
 
-                for sensor in sensors["coretemp"]:
+            self.process_labels.append(label)
+            processes.layout_box.addWidget(label)
 
-                    if sensor.current is not None:
+        main.addWidget(processes)
 
-                        label = sensor.label.lower()
+        self.footer = QLabel("--")
+        self.footer.setObjectName("Footer")
 
-                        if (
-                            "package" in label
-                            or "physical id" in label
-                        ):
-                            package_temp = sensor.current
-                            break
+        main.addWidget(self.footer)
 
-                if package_temp is None and core_temps:
-                    package_temp = max(core_temps)
+        scroll.setWidget(container)
+        self.setCentralWidget(scroll)
 
-                return core_temps, package_temp
+    def update_data(self):
 
-            # AMD / andere Systeme
-            all_temps = []
+        now = time.time()
 
-            for entries in sensors.values():
-
-                for sensor in entries:
-
-                    if sensor.current is not None:
-                        all_temps.append(sensor.current)
-
-            if all_temps:
-                return [], max(all_temps)
-
-        except Exception:
-            pass
-
-        return [], None
-
-    # =========================================================
-    # Uptime
-    # =========================================================
-
-    def get_uptime(self):
-
-        seconds = int(time.time() - psutil.boot_time())
-
-        days = seconds // 86400
-        seconds %= 86400
-
-        hours = seconds // 3600
-        seconds %= 3600
-
-        minutes = seconds // 60
-
-        return f"{days} Tage  {hours:02d}:{minutes:02d}"
-
-    # =========================================================
-    # Netzwerk
-    # =========================================================
-
-    def get_network(self):
-
-        current = psutil.net_io_counters()
-        now = time.monotonic()
-
-        elapsed = now - self.previous_net_time
-
-        if elapsed <= 0:
-            return 0, 0
-
-        download = (
-            current.bytes_recv -
-            self.previous_net.bytes_recv
-        ) / elapsed
-
-        upload = (
-            current.bytes_sent -
-            self.previous_net.bytes_sent
-        ) / elapsed
-
-        self.previous_net = current
-        self.previous_net_time = now
-
-        return download, upload
-
-    # =========================================================
-    # Bytes
-    # =========================================================
-
-    def format_bytes(self, value):
-
-        if value >= 1024 ** 3:
-            return f"{value / 1024 ** 3:.1f} GB"
-
-        if value >= 1024 ** 2:
-            return f"{value / 1024 ** 2:.1f} MB"
-
-        if value >= 1024:
-            return f"{value / 1024:.1f} KB"
-
-        return f"{value:.0f} B"
-
-    # =========================================================
-    # System aktualisieren
-    # =========================================================
-
-    def update_system(self):
-
-        # CPU
-        cpu_usage = psutil.cpu_percent(interval=None)
-
-        self.cpu_gauge.setValue(cpu_usage)
-
-        # RAM
-        memory = psutil.virtual_memory()
-
-        self.ram_gauge.setValue(memory.percent)
-
-        used = memory.used / 1024 ** 3
-        total = memory.total / 1024 ** 3
-        available = memory.available / 1024 ** 3
-
-        self.ram_info.setText(
-            f"Belegt: {used:.1f} / {total:.1f} GB"
-        )
-
-        self.ram_free.setText(
-            f"Frei: {available:.1f} GB"
-        )
-
-        # CPU Temperatur
-        core_temps, package_temp = self.get_temperatures()
-
-        if package_temp is not None:
-
-            self.cpu_temp.setText(
-                f"CPU Temperatur: {package_temp:.1f} °C"
-            )
-
-        else:
-
-            self.cpu_temp.setText(
-                "CPU Temperatur: nicht verfügbar"
-            )
-
-        # CPU Frequenz
-        try:
-
-            frequency = psutil.cpu_freq()
-
-            if frequency:
-
-                self.cpu_clock.setText(
-                    f"CPU Takt: {frequency.current:.0f} MHz"
-                )
-
-        except Exception:
-            self.cpu_clock.setText(
-                "CPU Takt: nicht verfügbar"
-            )
-
-        # CPU Modell
-        model = platform.processor()
-
-        if not model:
-            model = "CPU"
-
-        self.cpu_model.setText(
-            model
-        )
-
-        # Einzelne Kerne
-        core_usage = psutil.cpu_percent(
-            interval=None,
-            percpu=True
-        )
-
-        for i, widget in enumerate(self.core_widgets):
-
-            usage = (
-                core_usage[i]
-                if i < len(core_usage)
-                else 0
-            )
-
-            temperature = (
-                core_temps[i]
-                if i < len(core_temps)
-                else None
-            )
-
-            widget.update_core(
-                usage,
-                temperature
-            )
-
-        # Uptime
-        self.uptime.setText(
-            f"Uptime: {self.get_uptime()}"
-        )
-
-        # Load
-        try:
-
-            load = os_load_average()
-
-            self.load.setText(
-                f"Load: {load[0]:.2f} / "
-                f"{load[1]:.2f} / "
-                f"{load[2]:.2f}"
-            )
-
-        except Exception:
-
-            self.load.setText(
-                "Load: nicht verfügbar"
-            )
-
-        # Swap
+        cpu = psutil.cpu_percent(interval=None)
+        ram = psutil.virtual_memory()
         swap = psutil.swap_memory()
 
-        swap_used = swap.used / 1024 ** 3
-        swap_total = swap.total / 1024 ** 3
+        sensors = read_sensors()
 
-        self.swap.setText(
-            f"Swap: {swap_used:.1f} / "
-            f"{swap_total:.1f} GB"
+        self.cpu_card.set_value(cpu)
+        self.ram_card.set_value(ram.percent)
+        self.swap_card.set_value(swap.percent)
+
+        self.cpu_temp.setText(
+            fmt_temp(sensors["cpu_temp"])
         )
 
-        # SSD
-        try:
-
-            disk = psutil.disk_usage("/")
-
-            self.disk.setText(
-                f"SSD: {disk.percent:.0f}%  •  "
-                f"{disk.used / 1024**3:.1f} / "
-                f"{disk.total / 1024**3:.1f} GB"
-            )
-
-        except Exception:
-
-            self.disk.setText(
-                "SSD: nicht verfügbar"
-            )
-
-        # Netzwerk
-        download, upload = self.get_network()
-
-        self.network.setText(
-            f"Netzwerk: ↓ {self.format_bytes(download)}/s  "
-            f"↑ {self.format_bytes(upload)}/s"
+        self.temp_cpu.setText(
+            f"CPU: {fmt_temp(sensors['cpu_temp'])}"
         )
 
-        # Kernel
+        self.temp_wifi.setText(
+            f"WLAN: {fmt_temp(sensors['wifi_temp'])}"
+        )
+
+        self.temp_pch.setText(
+            f"PCH: {fmt_temp(sensors['pch_temp'])}"
+        )
+
+        self.temp_nvme.setText(
+            f"NVMe: {fmt_temp(sensors['nvme_temp'])}"
+        )
+
+        self.cpu_model.setText(
+            get_cpu_model()
+        )
+
+        freq = psutil.cpu_freq()
+
+        if freq:
+            frequency = f"{freq.current / 1000:.2f} GHz"
+        else:
+            frequency = "N/A"
+
+        cores = psutil.cpu_count(logical=False) or 0
+        threads = psutil.cpu_count(logical=True) or 0
+
+        self.cpu_info.setText(
+            f"Takt: {frequency}  •  Kerne: {cores}  •  Threads: {threads}"
+        )
+
+        load = os.getloadavg()
+
+        self.load_info.setText(
+            f"Load: {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}"
+        )
+
+        per_cpu = psutil.cpu_percent(
+            interval=None,
+            percpu=True,
+        )
+
+        for i, value in enumerate(per_cpu):
+
+            if i < len(self.core_widgets):
+                self.core_widgets[i].update_value(value)
+
+        self.gpu.setText(
+            f"GPU: {get_gpu()}"
+        )
+
+        self.fan.setText(
+            f"Lüfter: {sensors['fan']:.0f} RPM"
+            if sensors["fan"] is not None
+            else "Lüfter: N/A"
+        )
+
+        self.pwm.setText(
+            f"PWM: {sensors['pwm']:.0f} %"
+            if sensors["pwm"] is not None
+            else "PWM: N/A"
+        )
+
+        self.os_label.setText(
+            f"OS: {get_os()}"
+        )
+
         self.kernel.setText(
             f"Kernel: {platform.release()}"
         )
 
-        # RAM
-        self.memory.setText(
-            f"RAM frei: {available:.1f} GB"
+        self.desktop.setText(
+            f"Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', 'N/A')} / "
+            f"{os.environ.get('XDG_SESSION_TYPE', 'N/A')}"
         )
 
-        # Prozesse
-        try:
+        self.hostname.setText(
+            f"Hostname: {platform.node()}"
+        )
 
-            process_count = len(psutil.pids())
+        self.python.setText(
+            f"Python: {platform.python_version()}"
+        )
 
-            self.processes.setText(
-                f"Prozesse: {process_count}"
+        disk = psutil.disk_usage("/")
+
+        self.disk_info.setText(
+            f"Benutzt: {fmt_bytes(disk.used)}  •  "
+            f"Frei: {fmt_bytes(disk.free)}  •  "
+            f"Gesamt: {fmt_bytes(disk.total)}  •  "
+            f"{disk.percent:.1f} %"
+        )
+
+        self.disk_bar.setValue(
+            int(disk.percent)
+        )
+
+        net = psutil.net_io_counters()
+
+        elapsed = max(now - self.last_time, 0.001)
+
+        download = (
+            net.bytes_recv - self.last_net.bytes_recv
+        ) / elapsed
+
+        upload = (
+            net.bytes_sent - self.last_net.bytes_sent
+        ) / elapsed
+
+        self.down.setText(
+            f"↓ Download: {fmt_speed(download)}"
+        )
+
+        self.up.setText(
+            f"↑ Upload: {fmt_speed(upload)}"
+        )
+
+        self.total_down.setText(
+            f"↓ Gesamt: {fmt_bytes(net.bytes_recv)}"
+        )
+
+        self.total_up.setText(
+            f"↑ Gesamt: {fmt_bytes(net.bytes_sent)}"
+        )
+
+        interfaces = [
+            name
+            for name, info in psutil.net_if_stats().items()
+            if info.isup
+        ]
+
+        self.interfaces.setText(
+            "Interfaces: " + ", ".join(interfaces)
+        )
+
+        self.last_net = net
+        self.last_time = now
+
+        battery = get_battery()
+
+        if battery["percent"] is not None:
+            self.battery.setText(
+                f"Akku: {battery['percent']:.0f} %"
+            )
+        else:
+            self.battery.setText(
+                "Akku: N/A"
             )
 
-        except Exception:
+        self.battery_status.setText(
+            f"Status: {battery['status']}"
+        )
 
-            self.processes.setText(
-                "Prozesse: --"
-            )
+        self.battery_voltage.setText(
+            f"Spannung: {battery['voltage']:.2f} V"
+            if battery["voltage"] is not None
+            else "Spannung: N/A"
+        )
 
-        # Status
-        self.status.setText(
-            "● Überwachung aktiv  •  Aktualisierung: 1 Sekunde"
+        self.battery_power.setText(
+            f"Leistung: {battery['power']:.2f} W"
+            if battery["power"] is not None
+            else "Leistung: N/A"
+        )
+
+        processes = []
+
+        for proc in psutil.process_iter(
+            [
+                "pid",
+                "name",
+                "cpu_percent",
+                "memory_percent",
+            ]
+        ):
+
+            try:
+
+                info = proc.info
+
+                processes.append(
+                    (
+                        info["cpu_percent"] or 0,
+                        info["memory_percent"] or 0,
+                        info["pid"],
+                        info["name"] or "?",
+                    )
+                )
+
+            except (
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+            ):
+                pass
+
+        processes.sort(
+            key=lambda x: x[0],
+            reverse=True,
+        )
+
+        for i, label in enumerate(self.process_labels):
+
+            if i < len(processes):
+
+                cpu_p, ram_p, pid, name = processes[i]
+
+                label.setText(
+                    f"{name[:28]:<28} "
+                    f"PID {pid:<7} "
+                    f"CPU {cpu_p:5.1f}%  "
+                    f"RAM {ram_p:5.1f}%"
+                )
+
+            else:
+                label.setText("--")
+
+        self.clock.setText(
+            time.strftime("%H:%M:%S")
+        )
+
+        self.footer.setText(
+            f"Uptime: {uptime()}   •   "
+            f"Prozesse: {len(processes)}   •   "
+            f"Aktualisierung: 1 Sekunde"
         )
 
 
-def os_load_average():
-    return psutil.getloadavg()
+STYLE = """
+QMainWindow {
+    background: #0b0f14;
+}
+
+QScrollArea {
+    background: #0b0f14;
+}
+
+QWidget {
+    color: #e6edf3;
+    font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+    font-size: 12px;
+}
+
+QLabel#Title {
+    font-size: 25px;
+    font-weight: 700;
+    color: #ffffff;
+}
+
+QLabel#Subtitle {
+    color: #7d8996;
+    font-size: 12px;
+}
+
+QLabel#Clock {
+    color: #58a6ff;
+    font-size: 23px;
+    font-weight: 600;
+}
+
+QFrame#Card {
+    background: #111820;
+    border: 1px solid #202a35;
+    border-radius: 9px;
+}
+
+QLabel#CardTitle {
+    color: #8b98a7;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+QLabel#BigValue {
+    color: #58a6ff;
+    font-size: 21px;
+    font-weight: 700;
+}
+
+QLabel#Info {
+    color: #d7dee7;
+    padding: 2px 0;
+}
+
+QLabel#Process {
+    background: #151d26;
+    border-radius: 4px;
+    padding: 5px;
+    color: #c9d1d9;
+    font-family: monospace;
+    font-size: 11px;
+}
+
+QLabel#Footer {
+    color: #697684;
+    font-size: 11px;
+}
+
+QFrame#Core {
+    background: #151d26;
+    border: 1px solid #273341;
+    border-radius: 6px;
+}
+
+QLabel#CoreName {
+    color: #7d8996;
+    font-size: 10px;
+}
+
+QLabel#CoreValue {
+    color: #e6edf3;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QProgressBar {
+    background: #202832;
+    border: none;
+    border-radius: 3px;
+}
+
+QProgressBar::chunk {
+    background: #3498db;
+    border-radius: 3px;
+}
+
+QScrollBar:vertical {
+    background: #0b0f14;
+    width: 9px;
+}
+
+QScrollBar::handle:vertical {
+    background: #303b48;
+    border-radius: 4px;
+    min-height: 30px;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+"""
 
 
 def main():
 
     app = QApplication(sys.argv)
 
-    app.setStyle("Fusion")
-
-    app.setStyleSheet("""
-        QWidget {
-            background-color: #101318;
-            color: #eeeeee;
-            font-family: "Noto Sans";
-            font-size: 10pt;
-        }
-
-        #Title {
-            font-size: 26pt;
-            font-weight: bold;
-            color: #ffffff;
-        }
-
-        #Subtitle {
-            color: #888888;
-        }
-
-        #Card {
-            background-color: #181c22;
-            border: 1px solid #292f38;
-            border-radius: 14px;
-        }
-
-        #SectionTitle {
-            font-size: 14pt;
-            font-weight: bold;
-            color: #ffffff;
-            padding: 5px;
-        }
-
-        #Core {
-            background-color: #20252d;
-            border: 1px solid #303640;
-            border-radius: 10px;
-        }
-
-        #CoreName {
-            color: #cccccc;
-            font-weight: bold;
-        }
-
-        #CoreUsage {
-            color: #00d9ff;
-            font-size: 18pt;
-            font-weight: bold;
-        }
-
-        #CoreTemp {
-            color: #aaaaaa;
-            font-size: 9pt;
-        }
-
-        QProgressBar {
-            background-color: #11151a;
-            border: none;
-            border-radius: 4px;
-        }
-
-        QProgressBar::chunk {
-            background-color: #00d9ff;
-            border-radius: 4px;
-        }
-
-        #Temperature {
-            color: #ffb347;
-            font-size: 12pt;
-            font-weight: bold;
-        }
-
-        #Info {
-            color: #aaaaaa;
-        }
-
-        #InfoBox {
-            background-color: #20252d;
-            border-radius: 8px;
-            padding: 12px;
-            color: #dddddd;
-        }
-
-        #Status {
-            color: #55e67a;
-            padding: 5px;
-        }
-    """)
+    app.setApplicationName("System Monitor")
+    app.setStyleSheet(STYLE)
 
     window = SystemMonitor()
     window.show()
